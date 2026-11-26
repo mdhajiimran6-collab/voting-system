@@ -1,0 +1,244 @@
+rules_version = '2';
+
+// CampusConnect — Security Rules
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isRegistered() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isCommunityHost(communityId) {
+      return isRegistered()
+        && userDoc().role == 'host'
+        && userDoc().communityId == communityId;
+    }
+
+    function isCommunityOwner(communityId) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/communities/$(communityId))
+        && get(/databases/$(database)/documents/communities/$(communityId)).data.hostUid == request.auth.uid;
+    }
+
+    function isApprovedStudent(communityId) {
+      return isRegistered()
+        && userDoc().role == 'student'
+        && userDoc().communityId == communityId
+        && userDoc().faceEnrolled == true
+        && userDoc().hostApproved == true;
+    }
+
+    function sameCommunityMember(communityId) {
+      return isCommunityHost(communityId) || isApprovedStudent(communityId);
+    }
+
+    function electionDoc(electionId) {
+      return get(/databases/$(database)/documents/elections/$(electionId)).data;
+    }
+
+    // 1. Public code uniqueness check
+    match /community_codes/{code} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if isSignedIn()
+        && request.resource.data.hostUid == request.auth.uid
+        && !exists(/databases/$(database)/documents/community_codes/$(code));
+      allow update, delete: if false;
+    }
+
+    // 2. Community Registration Fee Payments (₹5 / ₹10)
+    match /community_payments/{paymentId} {
+      allow read: if isSignedIn() && resource.data.hostUid == request.auth.uid;
+      allow create: if isSignedIn()
+        && request.resource.data.hostUid == request.auth.uid
+        && request.resource.data.feePlanInr in [5, 10];
+      allow update, delete: if false;
+    }
+
+    // 3. Communities, Classrooms, Notices & Activities
+    match /communities/{communityId} {
+      allow read: if sameCommunityMember(communityId);
+      allow create: if isSignedIn()
+        && request.resource.data.hostUid == request.auth.uid
+        && request.resource.data.feePaidInr in [5, 10];
+      allow update, delete: if isCommunityHost(communityId);
+
+      match /classrooms/{classroomId} {
+        allow read: if sameCommunityMember(communityId);
+        allow create, update, delete: if isCommunityHost(communityId) || isCommunityOwner(communityId);
+      }
+
+      match /activities/{activityId} {
+        allow read: if sameCommunityMember(communityId);
+        allow create, update, delete: if isCommunityHost(communityId) || isCommunityOwner(communityId);
+      }
+
+      match /announcements/{announcementId} {
+        allow read: if sameCommunityMember(communityId);
+        allow create, update, delete: if isCommunityHost(communityId) || isCommunityOwner(communityId);
+      }
+    }
+
+    // 4. Host-Registered Student Emails
+    match /student_invites/{email} {
+      allow get: if true;
+      allow list: if isSignedIn() && userDoc().role == 'host' && resource.data.communityId == userDoc().communityId;
+      allow create: if isCommunityHost(request.resource.data.communityId);
+      allow update: if isCommunityHost(resource.data.communityId)
+        || (
+          isSignedIn()
+          && request.auth.token.email == email
+          && request.resource.data.communityId == resource.data.communityId
+          && request.resource.data.email == resource.data.email
+          && (
+            request.resource.data.onboardingStatus == 'pending_host_approval'
+            || (
+              request.resource.data.onboardingStatus == resource.data.onboardingStatus
+              && resource.data.onboardingStatus == 'approved'
+            )
+          )
+        );
+      allow delete: if isCommunityHost(resource.data.communityId);
+    }
+
+    // 5. Student, Host & Candidate Profiles
+    match /users/{uid} {
+      allow get: if isSignedIn() && (
+        request.auth.uid == uid
+        || userDoc().communityId == resource.data.communityId
+      );
+      allow list: if isSignedIn()
+        && isRegistered()
+        && userDoc().communityId == resource.data.communityId;
+      allow create: if isSignedIn() && request.auth.uid == uid && (
+        (
+          request.resource.data.role == 'host'
+          && get(/databases/$(database)/documents/communities/$(request.resource.data.communityId)).data.hostUid == request.auth.uid
+        )
+        || (
+          request.resource.data.role == 'student'
+          && request.resource.data.hostApproved == false
+          && request.auth.token.email == request.resource.data.email
+          && get(/databases/$(database)/documents/student_invites/$(request.auth.token.email)).data.communityId == request.resource.data.communityId
+        )
+      );
+      allow update: if isCommunityHost(resource.data.communityId)
+        || (
+          isSignedIn()
+          && request.auth.uid == uid
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.communityId == resource.data.communityId
+          && request.resource.data.hostApproved == resource.data.hostApproved
+        );
+      allow delete: if isCommunityHost(resource.data.communityId);
+    }
+
+    // 6. Submitted Face Scans & Community Duplicate-Face Registry
+    match /face_profiles/{uid} {
+      allow get: if isSignedIn() && (
+        request.auth.uid == uid
+        || isCommunityHost(resource.data.communityId)
+      );
+      allow list: if isCommunityHost(resource.data.communityId);
+      allow write: if isSignedIn()
+        && request.auth.uid == uid
+        && (
+          (isRegistered() && userDoc().communityId == request.resource.data.communityId)
+          || getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.communityId == request.resource.data.communityId
+        );
+    }
+
+    match /face_signatures/{sigId} {
+      allow read: if isSignedIn() && userDoc().communityId == resource.data.communityId;
+      allow write: if isSignedIn()
+        && (
+          (isRegistered() && userDoc().communityId == request.resource.data.communityId)
+          || getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.communityId == request.resource.data.communityId
+        )
+        && (request.resource.data.uid == request.auth.uid || isCommunityHost(request.resource.data.communityId));
+      allow delete: if isCommunityHost(resource.data.communityId);
+    }
+
+    // 7. Elections, Nominations, Unlinkable Ballots & Host-Published Results
+    match /elections/{electionId} {
+      allow read: if sameCommunityMember(resource.data.communityId);
+      allow create: if isCommunityHost(request.resource.data.communityId);
+      allow update, delete: if isCommunityHost(resource.data.communityId);
+
+      match /nominations/{nominationId} {
+        allow read: if sameCommunityMember(electionDoc(electionId).communityId);
+        allow create: if (
+          isApprovedStudent(electionDoc(electionId).communityId)
+          && request.resource.data.studentUid == request.auth.uid
+          && request.resource.data.status == 'pending'
+        ) || isCommunityHost(electionDoc(electionId).communityId);
+        allow update: if isCommunityHost(electionDoc(electionId).communityId);
+        allow delete: if isCommunityHost(electionDoc(electionId).communityId)
+          || (
+            isApprovedStudent(electionDoc(electionId).communityId)
+            && resource.data.studentUid == request.auth.uid
+            && resource.data.status == 'pending'
+          );
+      }
+
+      match /voter_participation/{studentUid} {
+        allow read: if isSignedIn() && (
+          request.auth.uid == studentUid
+          || isCommunityHost(electionDoc(electionId).communityId)
+        );
+        allow create: if isApprovedStudent(electionDoc(electionId).communityId)
+          && request.auth.uid == studentUid
+          && !exists(/databases/$(database)/documents/elections/$(electionId)/voter_participation/$(studentUid))
+          && electionDoc(electionId).status != 'closed'
+          && (
+            electionDoc(electionId).status == 'active'
+            || (
+              request.time >= electionDoc(electionId).startAt - duration.value(2, 'm')
+              && request.time < electionDoc(electionId).endAt
+            )
+          );
+        allow update, delete: if false;
+      }
+
+      match /ballots/{ballotId} {
+        allow read: if isCommunityHost(electionDoc(electionId).communityId);
+        allow create: if isApprovedStudent(electionDoc(electionId).communityId)
+          && !('studentUid' in request.resource.data)
+          && electionDoc(electionId).status != 'closed'
+          && (
+            electionDoc(electionId).status == 'active'
+            || (
+              request.time >= electionDoc(electionId).startAt - duration.value(2, 'm')
+              && request.time < electionDoc(electionId).endAt
+            )
+          );
+        allow update, delete: if false;
+      }
+
+      match /results/{docId} {
+        allow read: if isCommunityHost(electionDoc(electionId).communityId)
+          || (
+            isApprovedStudent(electionDoc(electionId).communityId)
+            && electionDoc(electionId).resultsPublished == true
+          );
+        allow write: if isCommunityHost(electionDoc(electionId).communityId);
+      }
+    }
+
+    // 8. Community Audit Log
+    match /audit_logs/{logId} {
+      allow read: if isCommunityHost(resource.data.communityId);
+      allow create: if isSignedIn() && userDoc().communityId == request.resource.data.communityId;
+      allow update, delete: if false;
+    }
+  }
+}
